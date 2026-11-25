@@ -1,0 +1,88 @@
+# Demo 04 workloads (stand-ins until JupyterHub is deployed).
+#   jupyter/session-broker : SA jupyter-session → Keycloak client "jupyter-session" (hub side, hop 1)
+#   jupyter/notebook       : SA jupyter-user    → Keycloak client "jupyter"         (notebook, hop 2)
+#   jupyter/imposter       : SA imposter        → no Keycloak client
+# Each pod: `svid` container (spire-agent CLI on the Workload API) + `curl` container, in the mesh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jupyter
+  labels: {istio-injection: enabled}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: jupyter-session, namespace: jupyter}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: session-broker, namespace: jupyter}
+spec:
+  selector: {matchLabels: {app: session-broker}}
+  template:
+    metadata: {labels: {app: session-broker}}
+    spec:
+      serviceAccountName: jupyter-session
+      containers:
+        - name: svid
+          image: ghcr.io/spiffe/spire-agent:1.16.0
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+          volumeMounts: [{name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}]
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: jupyter-user, namespace: jupyter}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: notebook, namespace: jupyter}
+spec:
+  selector: {matchLabels: {app: notebook}}
+  template:
+    metadata: {labels: {app: notebook}}
+    spec:
+      serviceAccountName: jupyter-user
+      containers:
+        - name: svid
+          image: ghcr.io/spiffe/spire-agent:1.16.0
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+          volumeMounts: [{name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}]
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: imposter, namespace: jupyter}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: imposter, namespace: jupyter}
+spec:
+  selector: {matchLabels: {app: imposter}}
+  template:
+    metadata: {labels: {app: imposter}}
+    spec:
+      serviceAccountName: imposter
+      containers:
+        - name: svid
+          image: ghcr.io/spiffe/spire-agent:1.16.0
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+          volumeMounts: [{name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}]
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}

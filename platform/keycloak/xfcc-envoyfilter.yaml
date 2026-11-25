@@ -1,0 +1,26 @@
+# Keycloak's sidecar passes the caller's X.509-SVID to Keycloak in X-Forwarded-Client-Cert, so
+# Keycloak (x509cert-lookup provider "envoy") can issue RFC 8705 certificate-bound tokens
+# (cnf.x5t#S256) and verify bound subject tokens during token exchange.
+#  - SANITIZE_SET: drop any XFCC the caller sent and set it from the verified mTLS peer only
+#    (Istio's sidecar default is APPEND_FORWARD, which would let a caller inject a certificate).
+#  - Cert: include the URL-encoded PEM (the default only has Hash/Subject/URI/DNS).
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata: {name: keycloak-xfcc-cert, namespace: keycloak}
+spec:
+  workloadSelector:
+    labels: {app: keycloak}
+  configPatches:
+    - applyTo: NETWORK_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter: {name: envoy.filters.network.http_connection_manager}
+      patch:
+        operation: MERGE
+        value:
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            forward_client_cert_details: SANITIZE_SET
+            set_current_client_cert_details: {subject: true, cert: true, uri: true, dns: true}

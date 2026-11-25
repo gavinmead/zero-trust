@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# trace [seconds]   (default 60)
+# Merge the Istio sidecar access logs of every hop in the OBO chain, sorted by time.
+# Peer IPs are replaced with pod names so you can see who called whom.
+set -euo pipefail
+since=${1:-60}
+CTX=${CTX:-kind-zt}
+k() { kubectl --context "$CTX" "$@"; }
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+k get pods -A -o jsonpath='{range .items[*]}{.status.podIP} {.metadata.namespace}/{.metadata.name}{"\n"}{end}' > "$tmp/ips"
+for t in jupyter/hub spark/spark-connect unity-catalog/uc-gateway unity-catalog/unity-catalog keycloak/keycloak storage/minio; do
+  ns=${t%/*} app=${t#*/}
+  for p in $(k -n "$ns" get pods -o name | grep "/$app" || true); do
+    k -n "$ns" logs "$p" -c istio-proxy --since="${since}s" 2>/dev/null | grep '^\[' | sed "s|^|$ns/${p#pod/} |" >> "$tmp/log" || true
+  done
+done
+[ -s "$tmp/log" ] || { echo "no access-log lines in the last ${since}s"; exit 0; }
+python3 - "$tmp/ips" "$tmp/log" <<'PY'
+import re, sys
+ips = dict(l.split() for l in open(sys.argv[1]) if len(l.split()) == 2)
+rows = []
+for line in open(sys.argv[2]):
+    me, rest = line.split(" ", 1)
+    m = re.match(r'\[(\S+)\] "(\S+) (\S+) [^"]*" (\d+) .*?(inbound|outbound)\|(\d+)\|[^ ]* (\S+) (\S+) (\S+)', rest)
+    if not m: continue
+    ts, meth, path, code, direction, port, a, b, c = m.groups()
+    if direction != "inbound": continue          # one line per hop: the receiver's view
+    peer = ips.get(c.rsplit(":", 1)[0], c)
+    rows.append((ts, f"{ts[11:23]}  {peer:<42} -> {me:<42} {code} {meth} {path[:90]}"))
+for _, r in sorted(rows): print(r)
+PY

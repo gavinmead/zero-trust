@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Decode a JWT from stdin or argv (no verification) and print header + payload.
+exp/iat/nbf are annotated with time remaining/elapsed."""
+import base64, json, sys, time
+
+def part(s):
+    s += "=" * (-len(s) % 4)
+    return json.loads(base64.urlsafe_b64decode(s))
+
+tok = (sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read()).strip()
+if tok.lower().startswith("bearer "):
+    tok = tok[7:]
+h, p = tok.split(".")[:2]
+print("header ", json.dumps(part(h)))
+payload = part(p)
+now = int(time.time())
+for k in ("iat", "nbf", "exp"):
+    if k in payload:
+        d = payload[k] - now
+        payload[k] = f"{payload[k]}  ({'in ' if d >= 0 else ''}{abs(d)}s{'' if d >= 0 else ' ago'})"
+print(json.dumps(payload, indent=2))

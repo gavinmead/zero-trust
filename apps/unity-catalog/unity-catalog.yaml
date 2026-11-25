@@ -1,0 +1,123 @@
+# Phase 7: Unity Catalog OSS 0.7.0 in namespace unity-catalog, in the mesh.
+#
+#   Auth     server.authorization=enable. UC accepts Keycloak tokens only at its token endpoint
+#            (POST /api/1.0/unity-control/auth/tokens, RFC 8693): issuer must be in
+#            server.allowed-issuers, aud in server.audiences. It maps the token to a UC user by the
+#            `email` claim and issues its own UC token (signed with keys in etc/conf), which the REST
+#            API and UC's permission checks use. Spark Connect's interceptor does that exchange (hop 4).
+#   Storage  MinIO bucket lakehouse. For each table access UC calls STS AssumeRole on MinIO (as MinIO
+#            user unity-catalog, credentials from Secret uc-s3 via the AWS default chain) with a
+#            session policy scoped to that table's path, and vends the temporary credentials.
+#   State    H2 database, signing keys and the admin token live under etc/ on a PVC, seeded from the
+#            image on first start. server.properties comes from the ConfigMap below.
+#   Mesh     Only Spark Connect may call UC (AuthorizationPolicy); admin setup runs inside the pod.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: unity-catalog, namespace: unity-catalog}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: uc-server-properties, namespace: unity-catalog}
+data:
+  server.properties: |
+    server.env=dev
+    server.authorization=enable
+    # Keycloak realm zt; tokens must name unity-catalog in aud (the interceptor's hop-3 token).
+    server.allowed-issuers=http://keycloak.localhost/realms/zt
+    server.audiences=unity-catalog
+    # UC-issued tokens: no longer-lived than the Keycloak chain they came from.
+    server.access-token-timeout=PT10M
+    server.cookie-timeout=PT10M
+    # Managed Delta tables under the lakehouse bucket.
+    server.managed-table.enabled=true
+    storage-root.tables=s3://lakehouse/managed
+    # MinIO: STS AssumeRole via lab.zt.uc.MinioStsCredentialGenerator (apps/unity-catalog/image):
+    # UC's own path-scoped session policy minus the AWS KMS statement MinIO can't parse.
+    # MinIO ignores the role ARN; UC uses it to derive the ARN partition for the policy.
+    s3.bucketPath.0=s3://lakehouse
+    s3.region.0=us-east-1
+    s3.awsRoleArn.0=arn:aws:iam::000000000000:role/uc-lakehouse
+    s3.credentialGenerator.0=lab.zt.uc.MinioStsCredentialGenerator
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: uc-etc, namespace: unity-catalog}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: unity-catalog, namespace: unity-catalog}
+spec:
+  selector: {app: unity-catalog}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: unity-catalog, namespace: unity-catalog}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: unity-catalog}}
+  template:
+    metadata: {labels: {app: unity-catalog}}
+    spec:
+      serviceAccountName: unity-catalog   # spiffe://zt.lab/ns/unity-catalog/sa/unity-catalog
+      # UC's HTTP client (Armeria/Netty) resolves *.localhost to loopback and ignores DNS for it, but
+      # reads /etc/hosts first: send the issuer host to the keycloak-issuer Service (fixed ClusterIP).
+      hostAliases:
+        - {ip: 10.96.80.80, hostnames: [keycloak.localhost]}
+      nodeSelector: {zt.lab/role: workloads}
+      securityContext: {fsGroup: 101}
+      initContainers:
+        - name: seed-etc
+          image: zt-lab/unity-catalog:0.7.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              [ -f /pvc/.seeded ] || { cp -r /home/unitycatalog/etc/. /pvc/ && touch /pvc/.seeded && echo seeded; }
+              cp /config/server.properties /pvc/conf/server.properties
+          volumeMounts:
+            - {name: etc, mountPath: /pvc}
+            - {name: config, mountPath: /config, readOnly: true}
+      containers:
+        - name: unity-catalog
+          image: zt-lab/unity-catalog:0.7.0   # v0.7.0 + MinIO STS generator (`make uc-image`)
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef: {name: uc-s3}           # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (MinIO user)
+          env:
+            - {name: AWS_REGION, value: us-east-1}
+            - {name: AWS_ENDPOINT_URL_STS, value: "http://minio.storage.svc.cluster.local:9000"}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: etc, mountPath: /home/unitycatalog/etc}
+      volumes:
+        - name: etc
+          persistentVolumeClaim: {claimName: uc-etc}
+        - name: config
+          configMap: {name: uc-server-properties}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: unity-catalog, namespace: unity-catalog}
+spec:
+  selector: {matchLabels: {app: unity-catalog}}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["zt.lab/ns/unity-catalog/sa/uc-gateway"]   # phase 8: only the PEP
+      to: [{operation: {ports: ["8080"]}}]

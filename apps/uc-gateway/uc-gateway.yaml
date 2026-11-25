@@ -1,0 +1,154 @@
+# Phase 8: agentgateway 1.7.0 as the policy enforcement point (PEP) in front of Unity Catalog.
+#
+#   Spark Connect ──Keycloak token (aud=unity-catalog, cnf.x5t#S256 = spark-connect's X.509-SVID), mTLS──▶
+#   uc-gateway: verify JWT, caller SPIFFE ID, and that the token is presented by the certificate it is
+#               bound to (RFC 8705) ── hop 4: RFC 8693 exchange at UC's token endpoint ──▶ Unity Catalog
+#
+# The UC-issued bearer token only exists between the gateway and UC; Spark never holds it.
+#
+# How the gateway sees the client certificate: its Istio sidecar terminates mTLS and, with the
+# EnvoyFilter below (SANITIZE_SET), passes a single X-Forwarded-Client-Cert built from the verified
+# peer only: URI = caller's SPIFFE ID, Hash = hex SHA-256 of the caller's certificate (DER).
+# cnf.x5t#S256 is base64url(SHA-256(DER)), so the policy converts the hex digest to base64url in CEL
+# (agentgateway's sha256.encode returns hex and there is no hex decoder).
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: uc-gateway, namespace: unity-catalog}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: uc-gateway, namespace: unity-catalog}
+data:
+  config.yaml: |
+    config:
+      # agentgateway's default admin/stats/readiness ports (15000/15020/15021) are the Istio sidecar's.
+      adminAddr: localhost:19000
+      statsAddr: 0.0.0.0:19020
+      readinessAddr: 0.0.0.0:19021
+    binds:
+      - port: 8080
+        listeners:
+          - name: unity-catalog
+            routes:
+              - name: unity-catalog
+                backends:
+                  - host: unity-catalog.unity-catalog.svc.cluster.local:8080
+                policies:
+                  jwtAuth:
+                    mode: strict
+                    issuer: http://keycloak.localhost/realms/zt
+                    audiences: [unity-catalog]
+                    jwks:
+                      url: http://keycloak.keycloak.svc.cluster.local:8080/realms/zt/protocol/openid-connect/certs
+                    preserveToken: true   # the token exchange below reads it as the subject token
+                  authorization:
+                    rules:
+                      # 1. The token was issued to spark-connect, and spark-connect is presenting it.
+                      - require: >-
+                          jwt.azp == "spark-connect" &&
+                          request.headers["x-forwarded-client-cert"].split("URI=")[1].split(";")[0]
+                            == "spiffe://zt.lab/ns/spark/sa/spark-connect"
+                      # 2. RFC 8705: the token is bound (cnf) to the certificate of this very connection.
+                      - require: >-
+                          has(jwt.cnf) &&
+                          request.headers["x-forwarded-client-cert"].with(xfcc,
+                            {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7,
+                             "8": 8, "9": 9, "a": 10, "b": 11, "c": 12, "d": 13, "e": 14, "f": 15}.with(N,
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".with(A,
+                            xfcc.split("Hash=")[1].substring(0, 64).with(h,
+                              [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20].map(i,
+                                (N[h.charAt(3 * i)] * 256 + N[h.charAt(3 * i + 1)] * 16 + N[h.charAt(3 * i + 2)])
+                                  .with(v, A.charAt(v / 64) + A.charAt(v % 64))).join("")
+                              + A.charAt(N[h.charAt(63)] * 4)))))
+                          == jwt.cnf["x5t#S256"]
+                  # Hop 4: exchange the verified Keycloak token for a UC-issued token (UC checks issuer,
+                  # audience and signature, maps the user by email) and send that to UC instead.
+                  backendAuth:
+                    oauthTokenExchange:
+                      host: unity-catalog.unity-catalog.svc.cluster.local:8080
+                      path: /api/1.0/unity-control/auth/tokens
+                      requestedTokenType: urn:ietf:params:oauth:token-type:access_token
+---
+apiVersion: v1
+kind: Service
+metadata: {name: uc-gateway, namespace: unity-catalog}
+spec:
+  selector: {app: uc-gateway}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: uc-gateway, namespace: unity-catalog}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: uc-gateway}}
+  template:
+    metadata:
+      labels: {app: uc-gateway}
+    spec:
+      serviceAccountName: uc-gateway   # spiffe://zt.lab/ns/unity-catalog/sa/uc-gateway
+      nodeSelector: {zt.lab/role: workloads}
+      containers:
+        - name: agentgateway
+          image: ghcr.io/agentgateway/agentgateway@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b  # v1.7.0
+          args: ["-f", "/etc/agentgateway/config.yaml"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /healthz/ready, port: 19021}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/agentgateway, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: uc-gateway}
+---
+# Trustworthy client-certificate details for the gateway (same pattern as Keycloak's sidecar):
+# drop any XFCC the caller sent and set exactly one element from the verified mTLS peer.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata: {name: uc-gateway-xfcc, namespace: unity-catalog}
+spec:
+  workloadSelector:
+    labels: {app: uc-gateway}
+  configPatches:
+    - applyTo: NETWORK_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter: {name: envoy.filters.network.http_connection_manager}
+      patch:
+        operation: MERGE
+        value:
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            forward_client_cert_details: SANITIZE_SET
+            set_current_client_cert_details: {subject: true, uri: true, dns: true}
+---
+# Callers re-handshake at least every 60s, so the certificate the gateway sees is never much older
+# than the SVID the token was bound to (see platform/keycloak/token-endpoint-dr.yaml).
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: uc-gateway-connections, namespace: unity-catalog}
+spec:
+  host: uc-gateway.unity-catalog.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnectionDuration: 60s
+---
+# Mesh layer: only Spark Connect reaches the gateway…
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: uc-gateway, namespace: unity-catalog}
+spec:
+  selector: {matchLabels: {app: uc-gateway}}
+  action: ALLOW
+  rules:
+    - from: [{source: {principals: ["zt.lab/ns/spark/sa/spark-connect"]}}]
+      to: [{operation: {ports: ["8080"]}}]

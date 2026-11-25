@@ -1,0 +1,37 @@
+# Namespace, hub and user-pod service accounts, and the Istio route for http://jupyter.localhost
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jupyter
+  labels: {istio-injection: enabled}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jupyter-session       # the hub: spiffe://zt.lab/ns/jupyter/sa/jupyter-session (needs its k8s token for KubeSpawner)
+  namespace: jupyter
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jupyter-user          # every JupyterLab pod: spiffe://zt.lab/ns/jupyter/sa/jupyter-user
+  namespace: jupyter
+automountServiceAccountToken: false
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: jupyter, namespace: jupyter}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["jupyter.localhost"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: jupyter, namespace: jupyter}
+spec:
+  hosts: ["jupyter.localhost"]
+  gateways: [jupyter]
+  http:
+    - route: [{destination: {host: proxy-public.jupyter.svc.cluster.local, port: {number: 80}}}]

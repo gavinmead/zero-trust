@@ -1,0 +1,95 @@
+# Istio 1.32, sidecar mode, with SPIRE as the workload identity provider.
+# Based on samples/security/spire/istio-spire-config.yaml (release-1.32), with these changes:
+#  - trustDomain zt.lab (must match SPIRE global.spire.trustDomain)
+#  - the "spire" injection template is applied to every injected pod (defaultTemplates)
+#  - the template patches initContainers, because Kubernetes >= 1.33 runs
+#    istio-proxy as a native sidecar (an initContainer with restartPolicy: Always)
+#  - registration comes from SPIRE's default ClusterSPIFFEID (every non-system pod),
+#    so no spiffe.io/spire-managed-identity label is needed
+#  - the gateway waits for the SPIRE socket; the SPIRE agent exposes the Workload API
+#    as "socket" (an alias created by the chart's ensure-alternate-names init container)
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: istio-system
+  name: zt
+spec:
+  profile: default
+  meshConfig:
+    trustDomain: zt.lab
+    accessLogFile: /dev/stdout
+    defaultConfig:
+      holdApplicationUntilProxyStarts: true
+  values:
+    sidecarInjectorWebhook:
+      defaultTemplates: ["sidecar", "spire"]
+      templates:
+        spire: |
+          spec:
+            initContainers:
+            - name: istio-proxy
+              volumeMounts:
+              - name: workload-socket
+                mountPath: /run/secrets/workload-spiffe-uds
+                readOnly: true
+            volumes:
+              - name: workload-socket
+                csi:
+                  driver: "csi.spiffe.io"
+                  readOnly: true
+  components:
+    pilot:
+      k8s:
+        nodeSelector:
+          zt.lab/role: platform
+        env:
+          # RequestAuthentication jwksUri (Keycloak) is fetched by each sidecar over the mesh (mTLS),
+          # not by istiod: istiod isn't in the mesh, so Keycloak's STRICT mTLS resets its
+          # plaintext fetch and every JWT would be rejected.
+          - {name: PILOT_JWT_ENABLE_REMOTE_JWKS, value: envoy}
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        label:
+          istio: ingressgateway
+        k8s:
+          nodeSelector:
+            zt.lab/role: platform
+          # Fixed NodePorts so the host edge proxy (`make edge`) has a stable target.
+          service:
+            type: LoadBalancer
+            ports:
+              - {name: status-port, port: 15021, targetPort: 15021}
+              - {name: http2, port: 80, targetPort: 8080, nodePort: 30080}
+              - {name: https, port: 443, targetPort: 8443, nodePort: 30443}
+          overlays:
+            - apiVersion: apps/v1
+              kind: Deployment
+              name: istio-ingressgateway
+              patches:
+                - path: spec.template.spec.volumes.[name:workload-socket]
+                  value:
+                    name: workload-socket
+                    csi:
+                      driver: "csi.spiffe.io"
+                      readOnly: true
+                - path: spec.template.spec.containers.[name:istio-proxy].volumeMounts.[name:workload-socket]
+                  value:
+                    name: workload-socket
+                    mountPath: "/run/secrets/workload-spiffe-uds"
+                    readOnly: true
+                - path: spec.template.spec.initContainers
+                  value:
+                    - name: wait-for-spire-socket
+                      image: docker.io/library/busybox:1.37
+                      volumeMounts:
+                        - name: workload-socket
+                          mountPath: /run/secrets/workload-spiffe-uds
+                          readOnly: true
+                      command:
+                        - sh
+                        - -c
+                        - |-
+                          until [ -e /run/secrets/workload-spiffe-uds/socket ]; do
+                            echo "$(date -Iseconds) waiting for SPIRE Workload API socket"; sleep 5
+                          done

@@ -1,0 +1,249 @@
+{
+  "realm": "zt",
+  "displayName": "Zero Trust Lab",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 600,
+  "groups": [
+    {
+      "name": "data-analysts"
+    },
+    {
+      "name": "contractors"
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@zt.lab",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Analyst",
+      "groups": [
+        "/data-analysts"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${ALICE_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@zt.lab",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Contractor",
+      "groups": [
+        "/contractors"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${BOB_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "identityProviders": [
+    {
+      "alias": "spiffe",
+      "displayName": "SPIRE (zt.lab)",
+      "providerId": "spiffe",
+      "enabled": true,
+      "hideOnLogin": true,
+      "config": {
+        "trustDomain": "spiffe://zt.lab",
+        "bundleEndpoint": "https://spire-spiffe-oidc-discovery-provider.spire-server.svc.cluster.local/keys",
+        "fedClientAssertionMaxExp": "300"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "jupyterhub",
+      "name": "JupyterHub",
+      "description": "Browser login for JupyterHub (auth code + PKCE). Access tokens carry aud=spark-connect.",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${JUPYTERHUB_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://jupyter.localhost/hub/oauth_callback"
+      ],
+      "webOrigins": [
+        "http://jupyter.localhost"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://jupyter.localhost/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "aud-jupyter-session",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "jupyter-session",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "consentRequired": false
+    },
+    {
+      "clientId": "lab-cli",
+      "name": "Lab CLI (demo only)",
+      "description": "LAB ONLY: public client with the password grant so demo scripts can get user tokens without a browser (with or without scope delegation:client:spark-connect).",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "aud-spark-connect",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "spark-connect",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "lab-browser",
+      "name": "Lab browser login (demo only)",
+      "description": "LAB ONLY: public auth-code + PKCE client for demo scripts / your own browser. Requests scope delegation:client:spark-connect; may_act is issued only if a standing delegation grant covers the user.",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "aud-spark-connect",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "spark-connect",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "consentRequired": false,
+      "redirectUris": [
+        "http://127.0.0.1:8765/callback"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    },
+    {
+      "clientId": "spark-connect",
+      "name": "Spark Connect server",
+      "description": "Workload client. Authenticates with its SPIFFE JWT-SVID (no secret) and uses RFC 8693 token exchange to call Unity Catalog on behalf of the user.",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "federated-jwt",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "attributes": {
+        "jwt.credential.issuer": "spiffe",
+        "jwt.credential.sub": "spiffe://zt.lab/ns/spark/sa/spark-connect",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "aud-unity-catalog",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "unity-catalog",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "consentRequired": false
+    },
+    {
+      "clientId": "unity-catalog",
+      "name": "Unity Catalog API",
+      "description": "Resource server (audience only). No login flows.",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false
+    }
+  ],
+  "adminPermissionsEnabled": true
+}

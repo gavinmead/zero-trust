@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# svid <namespace> <workload>   e.g. svid spark deploy/spark-connect
+# Print the X.509-SVID the workload's Envoy sidecar presents, plus its RFC 8705 thumbprint
+# (base64url SHA-256 of the DER cert), the value Keycloak puts in cnf.x5t#S256.
+set -euo pipefail
+ns=$1 wl=$2
+istioctl --context "${CTX:-kind-zt}" proxy-config secret -n "$ns" "$wl" -o json | python3 -c '
+import base64, hashlib, json, subprocess, sys
+d = json.load(sys.stdin)
+for s in d["dynamicActiveSecrets"]:
+    c = s["secret"].get("tlsCertificate")
+    if not c: continue
+    pem = base64.b64decode(c["certificateChain"]["inlineBytes"])
+    first = pem.split(b"-----END CERTIFICATE-----")[0] + b"-----END CERTIFICATE-----\n"
+    subprocess.run(["openssl", "x509", "-noout", "-subject", "-issuer", "-serial", "-dates",
+                    "-ext", "subjectAltName"], input=first, check=True)
+    der = subprocess.run(["openssl", "x509", "-outform", "DER"], input=first,
+                         capture_output=True, check=True).stdout
+    print("x5t#S256 =", base64.urlsafe_b64encode(hashlib.sha256(der).digest()).rstrip(b"=").decode())
+    print("sha256 (hex, as in XFCC Hash=) =", hashlib.sha256(der).hexdigest())
+    break
+'

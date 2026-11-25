@@ -1,0 +1,62 @@
+# Demo 02 workloads (stand-ins until the real Spark Connect server arrives in phase 6).
+#   spark/spark-connect : registered in Keycloak as client "spark-connect" by SPIFFE ID
+#   spark/imposter      : same namespace, different service account → different SPIFFE ID
+# Each pod has a `svid` container (spire-agent CLI against the Workload API via the CSI driver)
+# and a `curl` container. Both pods are in the mesh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark
+  labels: {istio-injection: enabled}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: spark-connect, namespace: spark}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: imposter, namespace: spark}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: obo-client, namespace: spark}
+spec:
+  selector: {matchLabels: {app: obo-client}}
+  template:
+    metadata: {labels: {app: obo-client}}
+    spec:
+      serviceAccountName: spark-connect
+      containers:
+        - name: svid
+          image: ghcr.io/spiffe/spire-agent:1.16.0
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+          volumeMounts: [{name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}]
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: imposter, namespace: spark}
+spec:
+  selector: {matchLabels: {app: imposter}}
+  template:
+    metadata: {labels: {app: imposter}}
+    spec:
+      serviceAccountName: imposter
+      containers:
+        - name: svid
+          image: ghcr.io/spiffe/spire-agent:1.16.0
+          command: ["/opt/spire/bin/spire-agent"]
+          args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+          volumeMounts: [{name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}]
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}

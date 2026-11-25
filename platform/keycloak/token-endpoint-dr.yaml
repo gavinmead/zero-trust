@@ -1,0 +1,17 @@
+# Certificate-bound tokens (RFC 8705) and SVID rotation.
+#
+# Keycloak binds a token to the client certificate of the mTLS connection that carried the token
+# request (XFCC from its sidecar). Sidecars pool upstream connections, so after SPIRE rotates a
+# workload's X.509-SVID, requests can keep riding an older connection, and Keycloak binds tokens to a
+# certificate the workload no longer presents (demo 04 caught this: cnf ≠ the current SVID).
+# Capping connection lifetime to Keycloak means a token is bound to a certificate at most 60s old.
+# No tls block: Istio auto-mTLS still applies.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: keycloak-connections, namespace: keycloak}
+spec:
+  host: keycloak.keycloak.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnectionDuration: 60s

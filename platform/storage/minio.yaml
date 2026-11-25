@@ -1,0 +1,127 @@
+# Phase 7: MinIO (S3 + STS) in namespace storage, in the mesh.
+#
+# Upstream MinIO no longer publishes container images; this is Chainguard's build of the current
+# MinIO release, pinned by digest. Root credentials and Unity Catalog's MinIO user come from
+# scripts/gen-secrets.sh (Secret storage/minio-root).
+#
+#   bucket   lakehouse                       Unity Catalog's storage root (tables live under it)
+#   user     unity-catalog (policy uc-lakehouse: full access to the bucket only). UC calls STS
+#            AssumeRole as this user with a session policy scoped to one table's path, and vends the
+#            resulting temporary credentials to Spark (MinIO intersects the two policies).
+#
+# AuthorizationPolicy: only Unity Catalog (STS), Spark Connect (data) and the setup job reach :9000.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: minio, namespace: storage}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: minio, namespace: storage}
+spec:
+  selector: {app: minio}
+  ports:
+    - {name: http-s3, port: 9000, targetPort: 9000}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: minio, namespace: storage}
+spec:
+  serviceName: minio
+  replicas: 1
+  selector: {matchLabels: {app: minio}}
+  template:
+    metadata: {labels: {app: minio}}
+    spec:
+      serviceAccountName: minio
+      automountServiceAccountToken: false
+      nodeSelector: {zt.lab/role: workloads}
+      securityContext: {fsGroup: 65532}
+      containers:
+        - name: minio
+          image: cgr.dev/chainguard/minio@sha256:f6243be11aaaa2fe654d260558e2b3fcef50135e78a3abfd0db802b13444f059
+          args: ["server", "/data", "--address", ":9000"]
+          envFrom:
+            - secretRef: {name: minio-root}
+          env:
+            - {name: MINIO_REGION, value: us-east-1}
+            - {name: MINIO_BROWSER, value: "off"}
+          ports: [{name: http-s3, containerPort: 9000}]
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: 9000}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          volumeMounts: [{name: data, mountPath: /data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 10Gi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: minio-policies, namespace: storage}
+data:
+  uc-lakehouse.json: |
+    {"Version": "2012-10-17",
+     "Statement": [
+       {"Effect": "Allow", "Action": ["s3:*"],
+        "Resource": ["arn:aws:s3:::lakehouse", "arn:aws:s3:::lakehouse/*"]}]}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: minio-setup, namespace: storage}
+automountServiceAccountToken: false
+---
+# Idempotent setup: bucket, policy, UC user. One mc command per init container (the image has no shell).
+apiVersion: batch/v1
+kind: Job
+metadata: {name: minio-setup, namespace: storage}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: minio-setup
+      restartPolicy: OnFailure
+      nodeSelector: {zt.lab/role: workloads}
+      initContainers:
+        - &mc
+          name: bucket
+          image: cgr.dev/chainguard/minio-client@sha256:11aa4baa385a6de421008f72d5019805475f2aa7d74d65d18b92c54986f36016
+          args: ["mb", "--ignore-existing", "zt/lakehouse"]
+          envFrom:
+            - secretRef: {name: minio-root}
+          env:
+            - {name: MC_HOST_zt, value: "http://$(MINIO_ROOT_USER):$(MINIO_ROOT_PASSWORD)@minio.storage.svc.cluster.local:9000"}
+            - {name: MC_CONFIG_DIR, value: /tmp/mc}
+          volumeMounts: [{name: policies, mountPath: /policies, readOnly: true}]
+        - <<: *mc
+          name: policy
+          args: ["admin", "policy", "create", "zt", "uc-lakehouse", "/policies/uc-lakehouse.json"]
+        - <<: *mc
+          name: user
+          args: ["admin", "user", "add", "zt", "$(MINIO_UC_ACCESS_KEY)", "$(MINIO_UC_SECRET_KEY)"]
+      containers:
+        - <<: *mc
+          name: attach
+          args: ["admin", "policy", "attach", "zt", "uc-lakehouse", "--user", "$(MINIO_UC_ACCESS_KEY)"]
+      volumes:
+        - name: policies
+          configMap: {name: minio-policies}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: minio, namespace: storage}
+spec:
+  selector: {matchLabels: {app: minio}}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - zt.lab/ns/unity-catalog/sa/unity-catalog   # STS AssumeRole (credential vending)
+              - zt.lab/ns/spark/sa/spark-connect           # table data, with UC-vended credentials
+              - zt.lab/ns/storage/sa/minio-setup
+      to: [{operation: {ports: ["9000"]}}]

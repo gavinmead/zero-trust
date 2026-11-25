@@ -1,0 +1,35 @@
+# Smoke test: a pod that mounts the SPIRE Workload API via the SPIFFE CSI driver.
+# The spire-agent image is distroless, so the container runs `spire-agent api watch`
+# (a long-lived Workload API client); use `kubectl exec` to run `api fetch` commands.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire-smoke
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smoke
+  namespace: spire-smoke
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke
+  namespace: spire-smoke
+spec:
+  serviceAccountName: smoke
+  containers:
+    - name: client
+      image: ghcr.io/spiffe/spire-agent:1.16.0
+      command: ["/opt/spire/bin/spire-agent"]
+      args: ["api", "watch", "-socketPath", "/spiffe-workload-api/spire-agent.sock"]
+      volumeMounts:
+        - name: spiffe-workload-api
+          mountPath: /spiffe-workload-api
+          readOnly: true
+  volumes:
+    - name: spiffe-workload-api
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true

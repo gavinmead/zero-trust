@@ -1,0 +1,43 @@
+# Make the issuer URL http://keycloak.localhost/realms/zt work inside the mesh (phase 7: Unity Catalog
+# fetches {issuer}/.well-known/openid-configuration and the jwks_uri it names, both on keycloak.localhost).
+#
+#   Address  Service keycloak-issuer has a fixed ClusterIP, 10.96.80.80 (port 80 → Keycloak :8080).
+#   DNS      CoreDNS rewrites keycloak.localhost → keycloak-issuer.keycloak.svc.cluster.local
+#            (scripts/coredns-issuer.py, `make keycloak-issuer`). Clients whose resolver treats
+#            *.localhost as loopback (RFC 6761; Netty, so Armeria in Unity Catalog) ignore DNS for it:
+#            give those pods hostAliases keycloak.localhost → 10.96.80.80 (Netty reads /etc/hosts first).
+#   Routing  Requests reach the sidecar's port-80 route with Host keycloak.localhost. Without this
+#            ServiceEntry the host is unknown and the request falls through to PassthroughCluster as
+#            plaintext, which Keycloak's STRICT mTLS rejects. The ServiceEntry sends it to Keycloak :8080.
+#   mTLS     The endpoint is found by DNS, so auto-mTLS can't tell it has a sidecar; the
+#            DestinationRule forces Istio mTLS and pins Keycloak's SPIFFE ID.
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak-issuer, namespace: keycloak}
+spec:
+  clusterIP: 10.96.80.80
+  selector: {app: keycloak}
+  ports:
+    - {name: http, port: 80, targetPort: 8080}
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata: {name: keycloak-issuer, namespace: keycloak}
+spec:
+  hosts: [keycloak.localhost]
+  location: MESH_INTERNAL
+  resolution: DNS
+  ports: [{number: 80, name: http, protocol: HTTP}]
+  endpoints:
+    - address: keycloak.keycloak.svc.cluster.local
+      ports: {http: 8080}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: keycloak-issuer, namespace: keycloak}
+spec:
+  host: keycloak.localhost
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+      subjectAltNames: ["spiffe://zt.lab/ns/keycloak/sa/keycloak"]

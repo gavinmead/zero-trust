@@ -1,0 +1,100 @@
+# Keycloak 26.8 (Quarkus) in the mesh.
+#  - Frontend URL / token issuer: http://keycloak.localhost (browser via `make edge` → Istio gateway)
+#  - Backchannel is dynamic: in-cluster workloads call http://keycloak.keycloak.svc:8080 and
+#    still get tokens with iss=http://keycloak.localhost/realms/zt
+#  - Features: spiffe (preview) + client-auth-federated → clients authenticate with SPIFFE JWT-SVIDs.
+#    Standard Token Exchange V2 (RFC 8693) is enabled by default.
+#  - Truststore: the SPIRE root CA (ConfigMap spire-bundle, from `make keycloak-truststore`), so
+#    Keycloak can fetch JWT-SVID signing keys from the SPIRE OIDC discovery provider over https.
+#  - Realm `zt` is imported at startup from ConfigMap keycloak-realm; ${VARS} come from keycloak-secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: keycloak, namespace: keycloak}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  selector: {app: keycloak}
+  ports:
+    - {name: http, port: 8080}
+    - {name: http-mgmt, port: 9000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  replicas: 1
+  # Single node with local caches: no JGroups/Infinispan clustering (which also clashes with
+  # the sidecar), and Recreate so a rollout never runs two instances at once.
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: keycloak}}
+  template:
+    metadata:
+      labels: {app: keycloak}
+    spec:
+      serviceAccountName: keycloak
+      nodeSelector: {zt.lab/role: platform}
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.8.2
+          args: ["start", "--import-realm"]
+          env:
+            - {name: KC_DB, value: postgres}
+            - {name: KC_DB_URL, value: "jdbc:postgresql://postgres.keycloak.svc:5432/keycloak"}
+            - {name: KC_DB_USERNAME, value: keycloak}
+            - {name: KC_HOSTNAME, value: "http://keycloak.localhost"}
+            - {name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC, value: "true"}
+            - {name: KC_HTTP_ENABLED, value: "true"}
+            - {name: KC_CACHE, value: local}
+            - {name: KC_PROXY_HEADERS, value: xforwarded}
+            - {name: KC_HEALTH_ENABLED, value: "true"}
+            - {name: KC_METRICS_ENABLED, value: "true"}
+            - {name: KC_FEATURES, value: "spiffe,client-auth-federated,token-exchange-delegation,parameterized-scopes"}
+            - {name: KC_TRUSTSTORE_PATHS, value: /opt/keycloak/conf/truststores/spire-bundle.pem}
+            # Client certificate from the sidecar's X-Forwarded-Client-Cert (see xfcc-envoyfilter.yaml),
+            # for RFC 8705 certificate-bound tokens. Only the SPIRE leaf is forwarded, so no chain.
+            - {name: KC_SPI_X509CERT_LOOKUP__PROVIDER, value: envoy}
+            - {name: KC_LOG_LEVEL, value: "INFO,org.keycloak.broker.spiffe:DEBUG,org.keycloak.authentication.authenticators.client:DEBUG"}
+            - {name: JAVA_OPTS_KC_HEAP, value: "-XX:MaxRAMPercentage=70"}
+          envFrom:
+            - secretRef: {name: keycloak-secrets}
+          ports:
+            - {containerPort: 8080, name: http}
+            - {containerPort: 9000, name: http-mgmt}
+          startupProbe:
+            httpGet: {path: /health/started, port: 9000}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health/ready, port: 9000}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 1536Mi}
+          volumeMounts:
+            - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
+            - {name: truststore, mountPath: /opt/keycloak/conf/truststores, readOnly: true}
+      volumes:
+        - name: realm
+          configMap: {name: keycloak-realm}
+        - name: truststore
+          configMap: {name: spire-bundle}
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["keycloak.localhost"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  hosts: ["keycloak.localhost"]
+  gateways: [keycloak]
+  http:
+    - route: [{destination: {host: keycloak.keycloak.svc.cluster.local, port: {number: 8080}}}]

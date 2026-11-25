@@ -1,0 +1,160 @@
+# Phase 6: Apache Spark Connect 4.2.1 behind Istio.
+#
+#   notebook (SA jupyter-user) --gRPC, Authorization: Bearer <Spark token>, mTLS--> spark/spark-connect:15002
+#
+# Spark Connect OSS doesn't authenticate callers itself, so the sidecar does:
+#   RequestAuthentication  the JWT must be a Keycloak (realm zt) token with aud=spark-connect.
+#   AuthorizationPolicy    ALLOW only when the mTLS peer is the notebook workload
+#                          (spiffe://zt.lab/ns/jupyter/sa/jupyter-user) AND the token is the
+#                          downscoped Spark token (scp contains spark:connect, azp=jupyter).
+#                          Anything else gets 403 (gRPC PERMISSION_DENIED); a bad JWT gets 401.
+# The driver runs in local mode inside this pod (no executor pods yet), as SA spark-connect
+# (Keycloak client spark-connect).
+#
+# Phase 7/8: lab.zt.spark.ZtAuthInterceptor (apps/spark/image) binds each Connect session's user_id to
+# the forwarded token's user and exchanges the token at Keycloak for a cert-bound Unity Catalog token
+# (hop 3, with the JWT-SVID that spiffe-helper keeps in /run/zt/jwt_svid.token). Catalog `lakehouse`
+# (Unity Catalog, Delta) uses ZtUcTokenProvider, which serves that token per session, and talks to
+# uc-gateway (agentgateway, apps/uc-gateway), which enforces the binding and does hop 4.
+# Table data is read and written on MinIO (s3://lakehouse) with UC-vended STS credentials.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: spiffe-helper, namespace: spark}
+data:
+  helper.conf: |
+    agent_address = "/spiffe-workload-api/spire-agent.sock"
+    cert_dir = "/run/zt"
+    daemon_mode = true
+    jwt_svids = [{
+      jwt_audience = "http://keycloak.localhost/realms/zt"
+      jwt_svid_file_name = "jwt_svid.token"
+    }]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: spark-connect, namespace: spark}
+spec:
+  selector: {app: spark-connect}
+  ports:
+    - {name: grpc-connect, port: 15002, targetPort: 15002, appProtocol: grpc}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: spark-connect, namespace: spark}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: spark-connect}}
+  template:
+    metadata: {labels: {app: spark-connect}}
+    spec:
+      serviceAccountName: spark-connect     # spiffe://zt.lab/ns/spark/sa/spark-connect
+      automountServiceAccountToken: false   # local mode: the driver doesn't call the k8s API
+      nodeSelector: {zt.lab/role: workloads}
+      initContainers:
+        # Native sidecar: starts before Spark and keeps running. Writes this pod's JWT-SVID
+        # (aud = Keycloak realm URL) to /run/zt and re-fetches it before it expires.
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          restartPolicy: Always
+          args: ["-config", "/etc/spiffe-helper/helper.conf"]
+          securityContext: {runAsUser: 185, runAsGroup: 185}
+          volumeMounts:
+            - {name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true}
+            - {name: spiffe-helper-conf, mountPath: /etc/spiffe-helper, readOnly: true}
+            - {name: zt-run, mountPath: /run/zt}
+      containers:
+        - name: spark-connect
+          # apache/spark:4.2.1 + Delta + UC connector + hadoop-aws + ZtAuthInterceptor (`make spark-image`)
+          image: zt-lab/spark-connect:4.2.1
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/spark/sbin/start-connect-server.sh"]
+          args:
+            - --master
+            - local[2]
+            - --conf
+            - spark.driver.memory=2g
+            - --conf
+            - spark.connect.grpc.binding.port=15002
+            - --conf
+            - spark.ui.enabled=false
+            - --conf
+            - spark.connect.grpc.interceptor.classes=lab.zt.spark.ZtAuthInterceptor
+            # Delta Lake
+            - --conf
+            - spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+            - --conf
+            - spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+            # Unity Catalog: catalog `lakehouse`, per-user token from the interceptor
+            - --conf
+            - spark.sql.catalog.lakehouse=io.unitycatalog.spark.UCSingleCatalog
+            - --conf
+            - spark.sql.catalog.lakehouse.uri=http://uc-gateway.unity-catalog.svc.cluster.local:8080
+            - --conf
+            - spark.sql.catalog.lakehouse.auth.type=lab.zt.spark.ZtUcTokenProvider
+            - --conf
+            - spark.sql.defaultCatalog=lakehouse
+            # S3A → MinIO; credentials are per table, vended by Unity Catalog
+            - --conf
+            - spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+            - --conf
+            - spark.hadoop.fs.s3a.endpoint=http://minio.storage.svc.cluster.local:9000
+            - --conf
+            - spark.hadoop.fs.s3a.endpoint.region=us-east-1
+            - --conf
+            - spark.hadoop.fs.s3a.path.style.access=true
+            - --conf
+            - spark.hadoop.fs.s3a.connection.ssl.enabled=false
+          env:
+            - {name: SPARK_NO_DAEMONIZE, value: "true"}   # stay in the foreground, log to stdout
+            - {name: SPARK_LOG_DIR, value: /tmp/spark-logs}
+            - {name: SPARK_PID_DIR, value: /tmp}
+            - {name: ZT_JWT_SVID_FILE, value: /run/zt/jwt_svid.token}
+            - {name: ZT_TOKEN_URL, value: "http://keycloak.keycloak.svc:8080/realms/zt/protocol/openid-connect/token"}
+            - {name: ZT_UC_CATALOGS, value: lakehouse}
+          ports: [{name: grpc-connect, containerPort: 15002}]
+          # exec probe over loopback: a tcpSocket probe would only reach the sidecar, which always accepts.
+          readinessProbe:
+            exec: {command: [bash, -c, "exec 3<>/dev/tcp/127.0.0.1/15002"]}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 500m, memory: 2Gi}
+            limits: {cpu: "2", memory: 3Gi}
+          volumeMounts:
+            - {name: zt-run, mountPath: /run/zt, readOnly: true}
+      volumes:
+        - name: spiffe-workload-api
+          csi: {driver: csi.spiffe.io, readOnly: true}
+        - name: spiffe-helper-conf
+          configMap: {name: spiffe-helper}
+        - name: zt-run
+          emptyDir: {medium: Memory}
+---
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata: {name: spark-connect-jwt, namespace: spark}
+spec:
+  selector: {matchLabels: {app: spark-connect}}
+  jwtRules:
+    - issuer: http://keycloak.localhost/realms/zt
+      jwksUri: http://keycloak.keycloak.svc.cluster.local:8080/realms/zt/protocol/openid-connect/certs
+      audiences: [spark-connect]
+      forwardOriginalToken: true   # keep the header: ZtAuthInterceptor needs it for hop 3
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: spark-connect, namespace: spark}
+spec:
+  selector: {matchLabels: {app: spark-connect}}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["zt.lab/ns/jupyter/sa/jupyter-user"]
+            requestPrincipals: ["http://keycloak.localhost/realms/zt/*"]
+      to:
+        - operation: {ports: ["15002"]}
+      when:
+        - {key: "request.auth.claims[scp]", values: ["spark:connect"]}
+        - {key: "request.auth.claims[azp]", values: ["jupyter"]}

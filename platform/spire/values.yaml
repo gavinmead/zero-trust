@@ -1,0 +1,47 @@
+# SPIRE via spiffe/helm-charts-hardened (chart spiffe/spire 0.31.0 → SPIRE 1.16.0)
+#   Everything lands in the spire-server namespace (server, controller manager,
+#   OIDC discovery provider, agent DaemonSet, SPIFFE CSI driver).
+global:
+  spire:
+    trustDomain: zt.lab          # must equal Istio meshConfig.trustDomain (phase 3)
+    clusterName: zt
+    namespaces:
+      create: false   # spire-server ns is created by the spire-crds install (`make spire`)
+    caSubject:
+      country: US
+      organization: Zero Trust Lab
+      commonName: zt.lab SPIRE Root CA
+    # JWT-SVID `iss` (and OIDC discovery issuer) defaults to oidc-discovery.zt.lab.
+    # Keycloak's SPIFFE client auth (phase 4) validates JWT-SVIDs; revisit if `iss` causes problems.
+
+spire-server:
+  nodeSelector:
+    zt.lab/role: platform
+  # Lab choice: a long-lived self-signed root so relying parties that need a static
+  # trust anchor (Keycloak's truststore for the https bundle endpoint) keep working.
+  # Production would use an UpstreamAuthority and short-lived intermediates.
+  caTTL: 8760h
+  # JWT-SVIDs are bearer credentials used as OAuth client assertions. The agent caches them
+  # and re-mints at half-life, so 5m keeps every SVID < ~2.5m old: inside Keycloak's
+  # federated assertion max age (fedClientAssertionMaxExp, 300s) and a small replay window.
+  defaultJwtSvidTTL: 5m
+  # Bundle endpoint (https_spiffe on :8443). Exposes the trust bundle that
+  # relying parties (Keycloak's SPIFFE identity provider) use to verify JWT-SVIDs.
+  federation:
+    enabled: true
+  controllerManager:
+    enabled: true
+    identities:
+      clusterSPIFFEIDs:
+        # Fallback identity for every pod outside the system namespaces:
+        # spiffe://zt.lab/ns/<ns>/sa/<sa>  (the shape Istio requires).
+        default:
+          enabled: true
+        # Not used in this lab.
+        test-keys:
+          enabled: false
+
+spiffe-oidc-discovery-provider:
+  enabled: true
+  nodeSelector:
+    zt.lab/role: platform

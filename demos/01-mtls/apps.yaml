@@ -1,0 +1,90 @@
+# Demo 01: SPIRE-backed mTLS in the Istio mesh.
+#   mesh-test (injected): httpbin + curl, both with sidecars and SPIRE SVIDs
+#   outside   (not injected): curl with no sidecar, which STRICT mTLS must reject
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mesh-test
+  labels:
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: outside
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: httpbin, namespace: mesh-test}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: curl, namespace: mesh-test}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: httpbin, namespace: mesh-test}
+spec:
+  selector: {matchLabels: {app: httpbin}}
+  template:
+    metadata: {labels: {app: httpbin}}
+    spec:
+      serviceAccountName: httpbin
+      containers:
+        - name: httpbin
+          image: docker.io/mccutchen/go-httpbin:v2.15.0
+          ports: [{containerPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: httpbin, namespace: mesh-test}
+spec:
+  selector: {app: httpbin}
+  ports: [{name: http, port: 8000, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: curl, namespace: mesh-test}
+spec:
+  selector: {matchLabels: {app: curl}}
+  template:
+    metadata: {labels: {app: curl}}
+    spec:
+      serviceAccountName: curl
+      containers:
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: curl, namespace: outside}
+spec:
+  selector: {matchLabels: {app: curl}}
+  template:
+    metadata: {labels: {app: curl}}
+    spec:
+      containers:
+        - name: curl
+          image: docker.io/curlimages/curl:8.11.1
+          command: ["sleep", "infinity"]
+---
+# Expose httpbin through the Istio ingress gateway (north-south), for checking the
+# gateway's SPIRE identity end to end.
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata: {name: mesh-test, namespace: mesh-test}
+spec:
+  selector: {istio: ingressgateway}
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: ["httpbin.zt.local"]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: httpbin, namespace: mesh-test}
+spec:
+  hosts: ["httpbin.zt.local"]
+  gateways: [mesh-test]
+  http:
+    - route: [{destination: {host: httpbin, port: {number: 8000}}}]

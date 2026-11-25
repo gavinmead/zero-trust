@@ -1,0 +1,4 @@
+.cloud-provider-kind.log
+.secrets/
+__pycache__/
+.claude/settings.local.json

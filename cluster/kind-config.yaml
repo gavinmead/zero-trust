@@ -1,0 +1,20 @@
+# kind cluster for the zero-trust OBO token-exchange lab.
+# LoadBalancer Services (Istio ingress, agentgateway) are served by
+# cloud-provider-kind running on the host, so no hostPort mappings are needed.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: zt
+networking:
+  # kindnet is fine for Istio sidecar mode.
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/12
+nodes:
+  - role: control-plane
+    labels:
+      zt.lab/role: control-plane
+  - role: worker
+    labels:
+      zt.lab/role: platform   # SPIRE, Istio, Keycloak, gateway
+  - role: worker
+    labels:
+      zt.lab/role: workloads  # JupyterHub, Spark, Unity Catalog, MinIO
