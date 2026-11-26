@@ -146,23 +146,26 @@ Hypothesis: "only the Spark Connect server can act as `spiffe://zt.lab/ns/spark/
    echo "$SVID" | jwt | grep sub
    ```
 
-3. Take a Spark token from alice's notebook (as in lesson 0.4) and do hop 3 *from the rogue pod*:
+3. Take a Spark token from alice's notebook (as in lesson 0.4) and do hop 3 *from the rogue pod*, exactly as Spark Connect's interceptor does it. First get spark-connect's own token (the *actor token*), then do a delegated exchange of alice's Spark token, which carries `may_act` naming spark-connect:
 
    ```bash
    SPARK=$(echo 'import zt_auth; print(zt_auth.spark_token())' | k -n jupyter exec -i jupyter-alice -c notebook -- sh -c 'cat > /tmp/nb.py && python /tmp/nb.py')
-   UC=$(k -n spark exec rogue -c curl -- curl -s http://keycloak.keycloak.svc:8080/realms/zt/protocol/openid-connect/token \
-     -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
-     -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-spiffe \
-     --data-urlencode "client_assertion=$SVID" --data-urlencode "subject_token=$SPARK" \
-     -d subject_token_type=urn:ietf:params:oauth:token-type:access_token -d audience=unity-catalog \
+   echo "$SPARK" | jwt | grep -A2 may_act
+   kc() { k -n spark exec rogue -c curl -- curl -s http://keycloak.keycloak.svc:8080/realms/zt/protocol/openid-connect/token \
+     -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-spiffe --data-urlencode "client_assertion=$SVID" "$@"; }
+   AT=urn:ietf:params:oauth:token-type:access_token
+   ACTOR=$(kc -d grant_type=client_credentials | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+   UC=$(kc -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+     --data-urlencode "subject_token=$SPARK" -d subject_token_type=$AT \
+     --data-urlencode "actor_token=$ACTOR" -d actor_token_type=$AT -d audience=unity-catalog \
      | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-   echo "$UC" | jwt | grep -E 'azp|preferred_username|x5t'
+   echo "$UC" | jwt | grep -E 'azp|preferred_username|client_id|x5t'
    svid spark pod/rogue | grep x5t
    k -n spark exec rogue -c curl -- curl -s -w '\n%{http_code}\n' -H "Authorization: Bearer $UC" \
      http://uc-gateway.unity-catalog.svc.cluster.local:8080/api/2.1/unity-catalog/catalogs
    ```
 
-   **Predict before the last command:** what status does uc-gateway return? Every downstream check (Keycloak's client auth, the `cnf` binding, the gateway's SPIFFE ID rule, UC's mesh policy) was designed in phases 4–8. Which of them can tell `rogue` from Spark Connect?
+   **Predict before the last command:** what status does uc-gateway return? Every downstream check (Keycloak's client auth, the standing delegation grant behind `may_act`/`act`, the `cnf` binding, the gateway's SPIFFE ID and `act` rules, UC's mesh policy) was designed in phases 4–8. Which of them can tell `rogue` from Spark Connect?
 
 4. Now find who can do this:
 

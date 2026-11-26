@@ -27,7 +27,7 @@ JupyterLab (alice) --session token--> [hub] ... --Spark token, mTLS--> Spark Con
                      cert-bound token (aud=unity-catalog), mTLS --> agentgateway (PEP: JWT + SPIFFE + cnf) --hop 4--> Unity Catalog --> MinIO
 ```
 
-As built (phases 5–8): the hub mints the session token, the notebook downscopes it, Spark Connect's interceptor does hop 3, and agentgateway checks the token's certificate binding and does hop 4. Variant B (Spark forwards the user token unchanged and agentgateway does hop 3 too) was not built.
+As built (phases 5–8): the hub mints the session token, the notebook downscopes it (and asks for `may_act` naming spark-connect), Spark Connect's interceptor does hop 3 as a *delegated* exchange, so the token carries `act`, and agentgateway checks `act` and the token's certificate binding, then does hop 4. Variant B (Spark forwards the user token unchanged and agentgateway does hop 3 too) was not built.
 
 ## Phases
 
@@ -133,7 +133,7 @@ Uses Keycloak preview features `token-exchange-delegation` and `parameterized-sc
 | Re-check | Client policy `standing-delegation` (executor `may-act`, `avoid-consent-check: true`, permission check on) re-validates `may_act` on every token response. |
 
 Flow:
-1. **Sign-in.** The user's login client asks for scope `delegation:client:spark-connect`. In the demo that's `lab-cli` (password grant); in the browser it's `lab-browser`. JupyterHub doesn't ask for it: its login token goes through demo 04's standard exchange, which refuses tokens carrying `may_act`. If a grant covers the user, the token gets `may_act: {sub: <spark-connect service account>, client_id: spark-connect}`. Otherwise Keycloak silently drops the scope.
+1. **Sign-in.** The user's login client asks for scope `delegation:client:spark-connect`. In the demo that's `lab-cli` (password grant); in the browser it's `lab-browser`. JupyterHub's login doesn't ask for it: its login token goes through demo 04's standard exchanges, which refuse tokens carrying `may_act`. In the notebook chain, hop 2 asks for it instead (see "Delegation in the notebook chain" below). If a grant covers the user, the token gets `may_act: {sub: <spark-connect service account>, client_id: spark-connect}`. Otherwise Keycloak silently drops the scope.
 2. **Actor token.** `spark-connect` authenticates with its JWT-SVID and gets its own token (`client_credentials`). That token is the `actor_token`.
 3. **Delegated exchange.** The exchange takes `subject_token` (user) and `actor_token`, and returns:
 
@@ -161,6 +161,23 @@ Other notes:
 - The actor client (`spark-connect`) must not be consent-required. When it was, the exchange failed with `Missing consents for Token Exchange in client spark-connect`.
 - `act.sub` is the Keycloak service-account UUID, not the SPIFFE ID; that's accepted for now. The SPIFFE identity is proven when `spark-connect` authenticates with its JWT-SVID.
 - The `actor_token` must be a Keycloak access token; a raw JWT-SVID isn't accepted. Nested `act` for multi-hop chains isn't documented.
+- Seeded grants (`platform/keycloak/delegation-grants.json`): group `data-analysts` (alice) and user `bob`. Bob needs his to use Spark (demo 05). Demo 03 removes it at the start, because its story begins with bob ungranted, and restores it on exit.
+
+### Delegation in the notebook chain (hops 2–3)
+
+The notebook chain uses standard exchange for hops 1 and 2, and Keycloak refuses `may_act` tokens there. So `may_act` enters the chain as late as possible:
+
+| Hop | Exchange | Asks for | Result |
+|---|---|---|---|
+| 2, notebook (`jupyter`) | standard | `spark:connect delegation:client:spark-connect` | Spark token with `may_act: {client_id: spark-connect}`, if a standing grant covers the user; otherwise the scope is silently dropped |
+| 3, Spark Connect (`spark-connect`) | **delegated**: `actor_token` = spark-connect's own `client_credentials` token | `audience=unity-catalog` | `act: {sub: <spark-connect service account>, client_id: spark-connect}`, still `cnf`-bound to spark-connect's X.509-SVID |
+
+Consequences:
+- **A standing delegation grant is now required to use Spark at all.** Without `may_act`, the interceptor refuses the request: `PERMISSION_DENIED: zt: no standing delegation grant ... (bob may not use Spark)`. Keycloak would refuse hop 3 anyway (`Invalid may_act claim`).
+- **The revocation window is the Spark token's lifetime** (≤ the login token's 10 min). The grant is checked when hop 2 mints the token, and `zt_auth` re-mints within a minute of expiry.
+- **uc-gateway requires `act.client_id == spark-connect`**, so a bound token from a plain exchange is refused (demo 06).
+- **`act` names a client, not a workload instance.** Any pod running as `spark/spark-connect` gets the same `act` (curriculum lesson 1.5). It records *which service* acted, and the gateway's SPIFFE and `cnf` checks bind it to a workload.
+- Still single-level: the UC token's `act` says spark-connect acted for alice, not that the request came through her notebook.
 
 ### Try it in your own browser
 
@@ -228,8 +245,8 @@ The notebook never uses the user's ID token. Instead, a SPIFFE-authenticated exc
 |---|---|---|---|
 | 0 | user signs in at `http://jupyter.localhost` | client `jupyterhub` | login token, `aud=jupyter-session`, kept in `auth_state` on the hub |
 | 1 | hub, `GET /hub/api/zt/session-token` | `.../sa/jupyter-session` → `jupyter-session` | session token: `aud=jupyter`, `scp=["session:token_exchange"]` |
-| 2 | notebook, `zt_auth.spark_token()` | `.../sa/jupyter-user` → `jupyter` | Spark token: `aud=spark-connect`, `scp=["spark:connect"]` |
-| 3 | Spark Connect's interceptor (phase 7) | `.../ns/spark/sa/spark-connect` | Keycloak UC token: `aud=unity-catalog`, `cnf.x5t#S256` bound |
+| 2 | notebook, `zt_auth.spark_token()` | `.../sa/jupyter-user` → `jupyter` | Spark token: `aud=spark-connect`, `scp=["spark:connect"]`, `may_act` naming spark-connect (with a standing grant) |
+| 3 | Spark Connect's interceptor (phase 7), delegated exchange | `.../ns/spark/sa/spark-connect` | Keycloak UC token: `aud=unity-catalog`, `act` = spark-connect, `cnf.x5t#S256` bound |
 | 4 | Spark Connect's interceptor → Unity Catalog's token endpoint | (UC checks issuer + audience) | UC-issued token, `sub=<email>` |
 
 In a notebook:
@@ -307,7 +324,7 @@ Phase 7 first ran hop 4 inside the interceptor too, with Spark calling UC direct
 
 1. Reads the `authorization` header, which the sidecar forwards (`forwardOriginalToken: true`). It decodes the JWT without re-verifying it: Istio already checked signature, issuer, audience and the mTLS peer, and port 15002 is reachable only through the sidecar. It still fails closed if `scp` lacks `spark:connect`.
 2. **Binds the session to the token.** The request's `user_context.user_id` must equal the token's `preferred_username`; otherwise `PERMISSION_DENIED: zt: user_id 'bob' does not match the token's user 'alice'`. Spark Connect keys sessions by (user_id, session_id), so a notebook can't reach another user's session by claiming their name.
-3. **Hop 3, Keycloak.** Exchanges the Spark token for `audience=unity-catalog` as client `spark-connect`. It authenticates with the pod's JWT-SVID, which a `spiffe-helper` 0.11.0 native sidecar keeps fresh in `/run/zt/jwt_svid.token`. Keycloak binds the result to spark-connect's X.509-SVID.
+3. **Hop 3, Keycloak (delegated).** Requires the Spark token's `may_act` to name `spark-connect`; otherwise `PERMISSION_DENIED: zt: no standing delegation grant`. Exchanges the Spark token for `audience=unity-catalog` as client `spark-connect`, with spark-connect's own `client_credentials` token as `actor_token` (reused ≤60s, like the UC tokens). It authenticates with the pod's JWT-SVID, which a `spiffe-helper` 0.11.0 native sidecar keeps fresh in `/run/zt/jwt_svid.token`. The result carries `act` and Keycloak binds it to spark-connect's X.509-SVID.
 4. **Records the token** for (user, Connect session) in `ZtTokens` and points the session's catalog at it (`spark.sql.catalog.lakehouse.auth.zt.session`). A minted token is reused for at most 60s (and never within 60s of expiry). After an SVID rotation, a token bound to the previous certificate fails the gateway's `cnf` check, so the cache has to stay short.
 
 `lab.zt.spark.ZtUcTokenProvider` is the UC connector's `auth.type` (the connector accepts a fully qualified `TokenProvider` class):
@@ -322,6 +339,7 @@ agentgateway 1.7.0, pinned by digest, runs in namespace `unity-catalog` as SA `u
 
 1. **`jwtAuth` (strict).** Issuer `http://keycloak.localhost/realms/zt`, `aud=unity-catalog`, JWKS from Keycloak's in-cluster URL. `preserveToken: true` keeps the token for hop 4.
 2. **Authorization (CEL), caller.** `jwt.azp == "spark-connect"`, and the caller's SPIFFE ID (from X-Forwarded-Client-Cert `URI=`) is `spiffe://zt.lab/ns/spark/sa/spark-connect`.
+   - **Delegation:** `jwt.act.client_id == "spark-connect"`. The token came from a delegated exchange, which Keycloak allows only while a standing grant covers the user.
 3. **Authorization (CEL), RFC 8705.** `jwt.cnf["x5t#S256"]` must equal base64url(SHA-256) of the certificate on this mTLS connection.
    - The gateway's sidecar terminates mTLS. A `SANITIZE_SET` EnvoyFilter makes it pass exactly one XFCC element built from the verified peer, whose `Hash=` is the hex SHA-256 of the client certificate.
    - agentgateway's CEL has `sha256.encode` (hex) but no hex decoder. The policy converts hex to base64url with a lookup map and arithmetic: 21 groups of 3 hex digits make 2 base64 characters each, plus one final character.
@@ -351,6 +369,8 @@ agentgateway's admin, metrics and readiness ports moved to 19000/19020/19021, be
 | same token, sent from `spark/imposter` | 403 `RBAC: access denied` (mesh) |
 | alice's Spark token (`aud=spark-connect`) | 401 `authentication failed` |
 | unbound token (`aud=unity-catalog`, no `cnf`; minted with `--bind none`) | 403 `authorization failed` |
+| bound token without `act` (plain exchange of a Spark token minted without the delegation scope) | 403 `authorization failed` |
+| alice's `may_act` Spark token sent to a plain exchange | refused by Keycloak: `Subject token with a delegation claim is not allowed for standard token exchange` |
 | Spark Connect → Unity Catalog directly | 403 `RBAC: access denied` |
 | `spark.zt.uc.claims` in alice's session | only the cert-bound Keycloak token; no UC-issued token |
 
@@ -397,8 +417,10 @@ Signs alice and bob in to JupyterHub (`scripts/hub_login.py`), then runs `demos/
 | grant bob `SELECT` on the table; bob reads | works |
 | bob inserts | fails at MinIO, `AccessDeniedException` on the object write: UC vended read-only credentials scoped to the table path |
 | revoke bob's `SELECT`; bob reads | UC 403 again |
+| revoke bob's standing **delegation** grant; bob runs any query | refused at hop 3 by the interceptor, `no standing delegation grant`, before Unity Catalog is involved |
+| restore the grant; bob queries | works |
 
-Both sessions' tokens show `UC sub=<email>` and a Keycloak hop with `aud=unity-catalog azp=spark-connect` that is cert-bound. Demo 04 still passes.
+Both sessions' tokens show a Keycloak hop with `aud=unity-catalog azp=spark-connect act=spark-connect` that is cert-bound. Demos 03 and 04 still pass.
 
 ### Caveats
 
@@ -416,7 +438,7 @@ Every token in the chain inherits the login token's `exp`. OAuthenticator only u
 
 ## Open questions to spike
 
-- ~~Does Keycloak emit `act`?~~ Yes, with the `token-exchange-delegation` preview and standing grants (demo 03). Open: multi-hop chains (Spark → gateway → UC), and whether to shorten the revocation window.
+- ~~Does Keycloak emit `act`?~~ Yes, with the `token-exchange-delegation` preview and standing grants (demo 03). Since this change, the notebook chain carries it too: `may_act` from hop 2, `act` from Spark Connect's delegated hop 3, enforced at uc-gateway ("Delegation in the notebook chain"). Open: *nested* `act` recording the whole path (notebook → Spark), which Keycloak doesn't document, and whether to shorten the revocation window.
 - ~~Can Unity Catalog OSS accept tokens from an external OIDC issuer (Keycloak)?~~ Yes, at its own token endpoint (hop 4), not on the API directly (phase 7).
 - ~~Does the UC connector cache the token at catalog initialisation?~~ With `auth.type` = a custom `TokenProvider`, it asks for the token on every call (`ZtUcTokenProvider`).
 - Executors: with real executor pods, data access happens off the driver; UC-vended storage credentials have to reach them, the UC token must not.

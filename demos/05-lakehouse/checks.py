@@ -3,7 +3,7 @@ pyspark mistakes a __main__ without __file__ for its own doctest run).
 
   python checks.py <step>     prints one line per check: "<label>: OK -> ..." or "<label>: DENIED -> ..."
 """
-import json, sys
+import json, re, sys
 import zt_auth
 
 TABLE = "lakehouse.analytics.trips"
@@ -14,12 +14,15 @@ def check(label, fn):
     try:
         print(f"{label}: OK -> {fn()}")
     except Exception as e:  # noqa: BLE001 - report every failure as a denial line
-        print(f"{label}: DENIED -> {type(e).__name__}: {str(e).splitlines()[0][:200]}")
+        msg = str(e)
+        grpc = re.search(r'details = "([^"]*)"', msg)   # raw gRPC errors put the reason on a later line
+        print(f"{label}: DENIED -> {type(e).__name__}: {(grpc.group(1) if grpc else msg.splitlines()[0])[:200]}")
 
 
 def whoami():
     k = json.loads(spark.conf.get("spark.zt.uc.claims"))["keycloak"]
-    return f"user={k.get('email')}, token aud={k.get('aud')} azp={k.get('azp')} cnf-bound={'cnf' in k}"
+    act = (k.get("act") or {}).get("client_id")
+    return f"user={k.get('email')}, token aud={k.get('aud')} azp={k.get('azp')} act={act} cnf-bound={'cnf' in k}"
 
 
 step = sys.argv[1]
@@ -39,3 +42,5 @@ elif step == "bob-select":
     check("show tables", lambda: [r.tableName for r in spark.sql("SHOW TABLES IN lakehouse.analytics").collect()])
     check("read", lambda: [tuple(r) for r in spark.table(TABLE).orderBy("id").collect()])
     check("insert", lambda: spark.sql(f"INSERT INTO {TABLE} VALUES (99, 'Bob', 0.0)").collect())
+elif step == "query":
+    check("query", lambda: spark.range(1).count())

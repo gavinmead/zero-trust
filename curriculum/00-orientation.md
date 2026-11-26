@@ -138,6 +138,7 @@ Fill in this table in your notes. Some cells need later lessons; mark them `?` a
 | Session token | | | | | | |
 | Spark token | | | | | | |
 | Keycloak UC token (hop 3) | | | | | | |
+| Spark Connect's actor token (hop 3) | | | | | | |
 | UC-issued token (hop 4) | | | | | | |
 | MinIO STS credentials | | | | | | |
 | X.509-SVID (any pod) | | | | | | |

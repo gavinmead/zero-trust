@@ -76,7 +76,7 @@ Total time is roughly 25–30 hours. Each module builds on the one before it, so
 | # | Lesson | Core question | Hands-on highlights | Time |
 |---|---|---|---|---|
 | 3 | Keycloak as AS: SPIFFE client auth and RFC 8693 | How does a workload authenticate to an AS without a client secret, and what does an exchange actually check? | Do hop 3 by hand with curl; take apart `federated-jwt`; find the 300 s assertion window and the missing `jti`; the V2 audience and scope rules (demo 02) | 2.5 h |
-| 4 | Delegation semantics: `act`, `may_act`, standing grants | When must the token say *who is acting*, and how fast does a revoke take effect? | Demo 03 step by step; measure the revocation window; shorten it and pay the refresh cost; compare `azp` vs `act` for audit | 2 h |
+| 4 | Delegation semantics: `act`, `may_act`, standing grants | When must the token say *who is acting*, and how fast does a revoke take effect? | Demo 03 step by step; why `may_act` enters the notebook chain only at hop 2; measure the revocation window for Spark access; what `act` can and can't prove (it names a client, not a pod); the case for nested `act` | 2 h |
 | 5 | Token chains, downscoping and sender-constraint | How do you stop a token skipping a hop, and stop a thief replaying it? | Demo 04 by hand; compute `x5t#S256` yourself and match it to `cnf`; hit the holder rule with `--bind all`; reproduce the pooled-connection binding bug on purpose | 3 h |
 
 ### Part III: The workloads

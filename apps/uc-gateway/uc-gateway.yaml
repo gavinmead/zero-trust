@@ -49,7 +49,11 @@ data:
                           jwt.azp == "spark-connect" &&
                           request.headers["x-forwarded-client-cert"].split("URI=")[1].split(";")[0]
                             == "spiffe://zt.lab/ns/spark/sa/spark-connect"
-                      # 2. RFC 8705: the token is bound (cnf) to the certificate of this very connection.
+                      # 2. RFC 8693 delegation: spark-connect is acting for the user (act), which Keycloak
+                      #    only issues while a standing delegation grant covers that user.
+                      - require: >-
+                          has(jwt.act) && jwt.act.client_id == "spark-connect"
+                      # 3. RFC 8705: the token is bound (cnf) to the certificate of this very connection.
                       - require: >-
                           has(jwt.cnf) &&
                           request.headers["x-forwarded-client-cert"].with(xfcc,

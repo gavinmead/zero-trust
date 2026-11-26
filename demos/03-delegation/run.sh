@@ -17,6 +17,8 @@
 #      grant at exchange time). The revocation window is the subject token lifespan.
 #   7. a may_act token sent to a plain (non-delegation) exchange is refused
 #
+# Bob's seeded grant (needed for Spark, demo 05) is removed at the start and restored on exit.
+#
 # ALICE_TOKEN=<token> skips the scripted login for alice (e.g. from scripts/browser_consent.py).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -58,7 +60,12 @@ delegate() {  # delegate <subject_token> <actor_token> → token response JSON
     --data-urlencode "actor_token=$2" -d actor_token_type=$AT -d requested_token_type=$AT -d audience=unity-catalog
 }
 
-hr "1. standing delegation grants"
+# The lab seeds a grant for bob too (he needs one to use Spark: demo 05). This demo's story starts
+# with bob ungranted, so it removes that grant first and restores the seed on exit.
+trap 'grants grant --actor spark-connect --user bob >/dev/null' EXIT
+grants revoke --actor spark-connect --user bob >/dev/null
+
+hr "1. standing delegation grants (bob's seeded grant is set aside for this demo)"
 grants list
 
 hr "2. alice signs in (no consent screen) asking for scope delegation:client:spark-connect"

@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # Demo 05: end-to-end on-behalf-of access to Unity Catalog tables on MinIO, from JupyterLab.
 #
-#   notebook ──Spark token──▶ Spark Connect ──(interceptor) hop 3 Keycloak, hop 4 UC──▶ UC token (per user)
-#   Spark/Delta ──UC token──▶ Unity Catalog (grants) ──STS AssumeRole, path-scoped──▶ MinIO credentials
+#   notebook ──Spark token (may_act)──▶ Spark Connect ──(interceptor) delegated hop 3 at Keycloak──▶
+#   cert-bound token with act ──▶ uc-gateway (hop 4) ──▶ Unity Catalog (grants)
+#   ──STS AssumeRole, path-scoped──▶ MinIO credentials
 #
 #   1. alice (CREATE TABLE on lakehouse.analytics) creates, writes and reads a managed Delta table
 #   2. bob (USE SCHEMA only) can't see, read or create tables          → UC 403
 #   3. grant bob SELECT on the table: he reads it, but his insert fails  → MinIO AccessDenied
 #      (UC vended him read-only credentials scoped to the table path)
 #   4. revoke bob's SELECT again
+#   5. revoke bob's standing delegation grant (spark-connect may act for bob): his next Spark session
+#      is refused at hop 3, before Unity Catalog is involved; then restore the seeded grant
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 CTX="${CTX:-kind-zt}"
 set -a; source .secrets/keycloak.env; set +a
 k() { kubectl --context "$CTX" -n jupyter "$@"; }
+grants() { python3 -I scripts/delegation_grants.py "$@" >/dev/null; }
 hr() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 uc_admin() {  # uc_admin <bin/uc args...>   (admin token stays inside the UC pod)
   kubectl --context "$CTX" -n unity-catalog exec deploy/unity-catalog -c unity-catalog -- \
@@ -72,4 +76,15 @@ hr "4. revoke bob's SELECT"
 uc_admin permission delete --securable_type table --name lakehouse.analytics.trips --principal bob@zt.lab --privilege SELECT
 out=$(run bob bob)
 expect "$out" read DENIED "403"
+
+hr "5. revoke bob's standing delegation grant (spark-connect may no longer act for him)"
+trap 'grants grant --actor spark-connect --user bob' EXIT   # restore the seed even if a check fails
+grants revoke --actor spark-connect --user bob
+out=$(run bob query)
+expect "$out" query DENIED "no standing delegation grant"
+grants grant --actor spark-connect --user bob
+out=$(run bob query)
+expect "$out" query OK
+echo "  (a Spark token minted before the revoke keeps working until it expires: the grant is checked"
+echo "   when Keycloak issues the token with may_act, not at exchange time)"
 echo; echo "demo 05 passed"

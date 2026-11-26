@@ -41,9 +41,13 @@ import org.sparkproject.connect.grpc.Status;
  *   1. requires the token's scp to contain spark:connect (fail closed if the mesh policy is missing),
  *   2. binds the session to the token: the client-chosen user_context.user_id must equal the
  *      token's preferred_username, otherwise PERMISSION_DENIED,
- *   3. hop 3: exchanges the Spark token (RFC 8693) at Keycloak for aud=unity-catalog, as client
- *      spark-connect with this pod's JWT-SVID (from the spiffe-helper sidecar). Keycloak binds it to
- *      spark-connect's X.509-SVID (cnf.x5t#S256),
+ *   3. hop 3: a *delegated* RFC 8693 exchange at Keycloak for aud=unity-catalog, as client
+ *      spark-connect with this pod's JWT-SVID (from the spiffe-helper sidecar). The Spark token must
+ *      carry may_act naming spark-connect (the notebook asks for scope
+ *      delegation:client:spark-connect, and Keycloak adds it only while a standing delegation grant
+ *      covers the user); spark-connect's own client_credentials token is the actor_token. The result
+ *      has act={sub, client_id=spark-connect} and is bound to spark-connect's X.509-SVID
+ *      (cnf.x5t#S256),
  *   4. records that token for (user, session) in ZtTokens, where ZtUcTokenProvider (the UC
  *      connector's auth.type) reads it, and binds the session's catalog to that key. No token is
  *      put in Spark conf; spark.zt.user and spark.zt.uc.claims (non-secret claims) are readable.
@@ -67,6 +71,8 @@ public final class ZtAuthInterceptor implements ServerInterceptor {
   /** Catalogs whose UC connector uses ZtUcTokenProvider; each gets auth.zt.session per session. */
   private static final String[] UC_CATALOGS = env("ZT_UC_CATALOGS", "lakehouse").split(",");
   private static final String REQUIRED_SCOPE = "spark:connect";
+  /** The client this server acts as; the Spark token's may_act must name it. */
+  private static final String ACTOR_CLIENT = env("ZT_ACTOR_CLIENT", "spark-connect");
   private static final String TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange";
   private static final String ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token";
 
@@ -76,6 +82,11 @@ public final class ZtAuthInterceptor implements ServerInterceptor {
       "ArtifactStatusesRequest");
 
   private record Minted(String ucToken, long exp, long reuseUntil, String claims) {}
+
+  private record Actor(String token, long reuseUntil) {}
+
+  /** spark-connect's own access token (client_credentials), the actor_token of every hop 3. */
+  private static volatile Actor actor;
 
   /** sha256(incoming Spark token) → bound UC token, reused for at most 60s (and not near expiry). */
   private static final ConcurrentHashMap<String, Minted> CACHE = new ConcurrentHashMap<>();
@@ -100,6 +111,10 @@ public final class ZtAuthInterceptor implements ServerInterceptor {
       return reject(call, Status.PERMISSION_DENIED, "zt: token lacks scp " + REQUIRED_SCOPE);
     }
     String tokenUser = claims.path("preferred_username").asText("");
+    if (!ACTOR_CLIENT.equals(claims.path("may_act").path("client_id").asText())) {
+      return reject(call, Status.PERMISSION_DENIED, "zt: no standing delegation grant: the token's "
+          + "may_act doesn't name " + ACTOR_CLIENT + " (" + tokenUser + " may not use Spark)");
+    }
 
     ServerCall.Listener<Q> delegate = next.startCall(call, headers);
     return new ForwardingServerCallListener.SimpleForwardingServerCallListener<Q>(delegate) {
@@ -176,13 +191,14 @@ public final class ZtAuthInterceptor implements ServerInterceptor {
     if (hit != null && now < hit.reuseUntil()) return hit;
     CACHE.values().removeIf(t -> t.reuseUntil() <= now);
 
-    // hop 3: Keycloak, as client spark-connect (JWT-SVID), aud=unity-catalog, cert-bound
-    Map<String, String> kc = new LinkedHashMap<>();
+    // hop 3: delegated exchange at Keycloak, as client spark-connect (JWT-SVID), aud=unity-catalog,
+    // actor_token = spark-connect's own token; the result carries act and is cert-bound
+    Map<String, String> kc = clientAuth();
     kc.put("grant_type", TOKEN_EXCHANGE);
-    kc.put("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe");
-    kc.put("client_assertion", Files.readString(SVID_FILE).trim());
     kc.put("subject_token", sparkToken);
     kc.put("subject_token_type", ACCESS_TOKEN);
+    kc.put("actor_token", actorToken(now));
+    kc.put("actor_token_type", ACCESS_TOKEN);
     kc.put("requested_token_type", ACCESS_TOKEN);
     kc.put("audience", UC_AUDIENCE);
     String kcToken = post(TOKEN_URL, kc, "Keycloak");
@@ -190,13 +206,36 @@ public final class ZtAuthInterceptor implements ServerInterceptor {
     JsonNode kcc = claims(kcToken);
     ObjectNode pub = JSON.createObjectNode();
     ObjectNode kcPub = pub.putObject("keycloak");
-    for (String f : new String[] {"email", "aud", "azp", "cnf", "exp"}) {
+    for (String f : new String[] {"email", "aud", "azp", "act", "cnf", "exp"}) {
       if (kcc.has(f)) kcPub.set(f, kcc.get(f));
     }
     long exp = kcc.path("exp").asLong(now + 60);
     Minted m = new Minted(kcToken, exp, Math.min(now + 60, exp - 60), JSON.writeValueAsString(pub));
     CACHE.put(k, m);
     return m;
+  }
+
+  /** Client authentication as spark-connect: this pod's current JWT-SVID. */
+  private static Map<String, String> clientAuth() throws Exception {
+    Map<String, String> f = new LinkedHashMap<>();
+    f.put("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe");
+    f.put("client_assertion", Files.readString(SVID_FILE).trim());
+    return f;
+  }
+
+  /**
+   * spark-connect's own token, reused for at most 60s like the UC tokens: Keycloak binds it to the
+   * certificate of the connection that requested it, so it must not outlive an SVID rotation by long.
+   */
+  private static String actorToken(long now) throws Exception {
+    Actor a = actor;
+    if (a != null && now < a.reuseUntil()) return a.token();
+    Map<String, String> f = clientAuth();
+    f.put("grant_type", "client_credentials");
+    String t = post(TOKEN_URL, f, "Keycloak (actor token)");
+    long exp = claims(t).path("exp").asLong(now + 60);
+    actor = new Actor(t, Math.min(now + 60, exp - 60));
+    return t;
   }
 
   private static String post(String url, Map<String, String> form, String who) throws Exception {

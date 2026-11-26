@@ -1,3 +1,4 @@
 [
-  { "actor": "spark-connect", "group": "data-analysts" }
+  { "actor": "spark-connect", "group": "data-analysts" },
+  { "actor": "spark-connect", "user": "bob" }
 ]

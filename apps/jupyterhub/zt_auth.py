@@ -60,8 +60,13 @@ def exchange(subject_token, audience, scope):
 
 
 def spark_token():
-    """Downscoped token for Spark Connect (aud=spark-connect, scp=["spark:connect"])."""
-    return exchange(session_token(), "spark-connect", "spark:connect")
+    """Downscoped token for Spark Connect (aud=spark-connect, scp=["spark:connect"]).
+
+    It also asks for delegation:client:spark-connect: Keycloak then adds may_act naming
+    spark-connect, but only while a standing delegation grant covers this user. Spark Connect's
+    hop 3 is a delegated exchange that needs it, so without a grant the user can't use Spark.
+    """
+    return exchange(session_token(), "spark-connect", "spark:connect delegation:client:spark-connect")
 
 
 SPARK_CONNECT_URL = os.environ.get("ZT_SPARK_CONNECT_URL", "sc://spark-connect.spark.svc.cluster.local:15002")
